@@ -128,6 +128,20 @@ async def probe_remote(video_url: str) -> dict:
     }
 
 
+async def get_remote_size(video_url: str) -> int | None:
+    """Ask the CDN for Content-Length via HEAD — gives the exact file size
+    without transferring any video bytes. Much faster than a full download,
+    but some CDNs don't answer HEAD requests reliably, so callers should
+    fall back to probe_video() if this returns None."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(video_url, timeout=10, allow_redirects=True) as resp:
+                cl = resp.headers.get("Content-Length")
+                return int(cl) if cl and cl.isdigit() else None
+    except Exception:
+        return None
+
+
 async def probe_video(video_url: str) -> dict:
     """Download the video to a temp file and run ffprobe on it for real
     resolution / bitrate / codec / size / fps — used once, on the highest
@@ -354,12 +368,33 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
     # Full download (for exact size/bitrate) only on whichever detected
     # source has the tallest short-side resolution — skips redundant
     # downloads of the lower tiers.
-    _best_label, best_url, _best_q = max(
+    best_label, best_url, best_quality = max(
         sources,
         key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0),
     )
 
-    original_quality = await probe_video(best_url)
+    # Fast path: a HEAD request gets the exact file size without downloading
+    # any video bytes, and tikwm already gives us the clip's duration — so we
+    # can compute bitrate from size/duration instead of doing a full download
+    # + ffprobe just to learn the size. Falls back to the slow full-download
+    # probe only if the CDN doesn't answer HEAD with a usable Content-Length.
+    size_bytes = await get_remote_size(best_url)
+    duration = meta.get("duration") or 0
+
+    if size_bytes:
+        bitrate_mbps = (
+            round((size_bytes * 8 / duration) / 1_000_000, 1) if duration else best_quality.get("bitrate_mbps")
+        )
+        original_quality = {
+            "width": best_quality.get("width"),
+            "height": best_quality.get("height"),
+            "codec": best_quality.get("codec"),
+            "bitrate_mbps": bitrate_mbps,
+            "size_mb": round(size_bytes / (1024 * 1024), 1),
+            "fps": best_quality.get("fps"),
+        }
+    else:
+        original_quality = await probe_video(best_url)
     categories = guess_categories(caption)
 
     return build_embed(meta, sources, original_quality, shadow, categories)
