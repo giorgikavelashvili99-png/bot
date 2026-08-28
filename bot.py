@@ -47,12 +47,12 @@ TIKTOK_URL_RE = re.compile(
 
 # --- crude keyword -> category map (heuristic, not TikTok's real classifier) ---
 CATEGORY_KEYWORDS = {
-    "Movies & TV works": ["movie", "film", "series", "tvshow", "goldberg", "you", "netflix"],
-    "Entertainment Culture": ["edit", "viral", "fyp", "trend", "meme"],
-    "Entertainment": [],  # fallback bucket, always included if nothing else matches strongly
-    "Music": ["song", "music", "sound", "remix", "dj"],
-    "Sports": ["football", "basketball", "soccer", "nba", "sport"],
-    "Comedy": ["funny", "comedy", "lol", "joke"],
+    "ფილმები და სერიალები": ["movie", "film", "series", "tvshow", "goldberg", "you", "netflix"],
+    "გასართობი კულტურა": ["edit", "viral", "fyp", "trend", "meme"],
+    "გართობა": [],  # fallback bucket, always included if nothing else matches strongly
+    "მუსიკა": ["song", "music", "sound", "remix", "dj"],
+    "სპორტი": ["football", "basketball", "soccer", "nba", "sport"],
+    "კომედია": ["funny", "comedy", "lol", "joke"],
 }
 
 
@@ -63,9 +63,9 @@ def guess_categories(caption: str) -> list[str]:
         if any(kw in caption_l for kw in kws):
             hits.append(cat)
     if not hits:
-        hits = ["Entertainment"]
-    elif "Entertainment" not in hits and len(hits) < 2:
-        hits.append("Entertainment")
+        hits = ["გართობა"]
+    elif "გართობა" not in hits and len(hits) < 2:
+        hits.append("გართობა")
     return hits[:3]
 
 
@@ -199,7 +199,7 @@ def short_quality_label(width: int | None, height: int | None, fps: int | None) 
     1080x1920) are classified by their conventional resolution (1080p),
     not the taller pixel count."""
     if not width or not height:
-        return "Unknown"
+        return "უცნობი"
     short_side = min(width, height)
     if short_side >= 2160:
         res = "4K"
@@ -211,7 +211,7 @@ def short_quality_label(width: int | None, height: int | None, fps: int | None) 
         res = "720p"
     else:
         res = f"{short_side}p"
-    fps_label = f"{fps}fps" if fps else "fps: N/A"
+    fps_label = f"{fps}fps" if fps else "fps: უცნობია"
     return f"{res} • {fps_label}"
 
 
@@ -230,9 +230,9 @@ def vq_score(bitrate_mbps: float | None, height: int | None) -> int:
 # (e.g. 540p / 720p / 1080p) — so we probe every *distinct* URL we're
 # given instead of assuming there are always exactly two tiers.
 QUALITY_SOURCES = [
-    ("🌐 Browser (SD)", "play"),
-    ("📱 Phone (HD)", "hdplay"),
-    ("💧 Watermarked", "wmplay"),
+    ("🌐 ბრაუზერი (SD)", "play"),
+    ("📱 ტელეფონი (HD)", "hdplay"),
+    ("💧 ვოთერმარკიანი", "wmplay"),
 ]
 
 
@@ -263,7 +263,7 @@ async def check_shadow_ban(hashtag: str, video_id: str) -> str:
     see if this video id shows up. NOT authoritative — many legit videos won't
     appear for unrelated reasons (recency, ranking, region)."""
     if not hashtag:
-        return "Unknown"
+        return "უცნობია"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -274,9 +274,9 @@ async def check_shadow_ban(hashtag: str, video_id: str) -> str:
                 data = await resp.json()
         videos = data.get("data", {}).get("videos", [])
         found = any(str(v.get("video_id")) == str(video_id) for v in videos)
-        return "No" if found else "Possibly (not found in hashtag feed)"
+        return "არა" if found else "შესაძლოა (ჰეშტეგის ფიდში ვერ მოიძებნა)"
     except Exception:
-        return "Unknown"
+        return "უცნობია"
 
 
 def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quality: dict, shadow: str, categories: list[str]) -> discord.Embed:
@@ -285,34 +285,34 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     created = datetime.fromtimestamp(meta.get("create_time", 0), tz=timezone.utc)
 
     embed = discord.Embed(
-        title="🎬 VIDEO • ANALYTICS",
+        title="🎬 ვიდეო • ანალიტიკა",
         color=0x1DA1F2,
     )
-    embed.set_author(name=f"👤 {author.get('nickname', author.get('unique_id', 'unknown'))}")
+    embed.set_author(name=f"👤 {author.get('nickname', author.get('unique_id', 'უცნობი'))}")
 
     embed.add_field(
         name="\u200b",
-        value=f"📅 {created.strftime('%d %B %Y, %H:%M:%S')}\n> {title}\n🎵 {meta.get('music_info', {}).get('title', 'original sound')}",
+        value=f"📅 {created.strftime('%d %B %Y, %H:%M:%S')}\n> {title}\n🎵 {meta.get('music_info', {}).get('title', 'ორიგინალი ხმა')}",
         inline=False,
     )
 
     stats = (
-        f"👁 **{meta.get('play_count', 0):,} Views**\n"
-        f"♡ **{meta.get('digg_count', 0):,} Likes**\n"
-        f"💬 **{meta.get('comment_count', 0):,} Comments**\n"
-        f"⭐ **{meta.get('collect_count', 0):,} Favorites**\n"
-        f"↗ **{meta.get('share_count', 0):,} Shares**\n"
-        f"⬇ **{meta.get('download_count', 0):,} Downloads**"
+        f"👁 **{meta.get('play_count', 0):,} ნახვა**\n"
+        f"♡ **{meta.get('digg_count', 0):,} მოწონება**\n"
+        f"💬 **{meta.get('comment_count', 0):,} კომენტარი**\n"
+        f"⭐ **{meta.get('collect_count', 0):,} ფავორიტი**\n"
+        f"↗ **{meta.get('share_count', 0):,} გაზიარება**\n"
+        f"⬇ **{meta.get('download_count', 0):,} ჩამოტვირთვა**"
     )
-    embed.add_field(name="📊 Statistics", value=stats, inline=False)
+    embed.add_field(name="📊 სტატისტიკა", value=stats, inline=False)
 
     info = (
         f"🆔 **ID** | `{meta.get('id')}`\n"
-        f"📡 **Source** | Browser\n"
-        f"📍 **Region** | {meta.get('region', '??')}\n"
-        f"🚫 **Shadow ban** | {shadow}"
+        f"📡 **წყარო** | ბრაუზერი\n"
+        f"📍 **რეგიონი** | {meta.get('region', '??')}\n"
+        f"🚫 **შადოუბანი** | {shadow}"
     )
-    embed.add_field(name="ℹ️ Information", value=info, inline=False)
+    embed.add_field(name="ℹ️ ინფორმაცია", value=info, inline=False)
 
     tier_lines = "\n".join(
         f"{label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
@@ -320,15 +320,15 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     )
     q = (
         f"{tier_lines}\n"
-        f"🌐 **Resolution** | {original_quality.get('width')}x{original_quality.get('height')}\n"
-        f"📦 **Codec** | {original_quality.get('codec')}\n"
-        f"📶 **Bitrate** | {original_quality.get('bitrate_mbps')} Mbps\n"
-        f"💾 **Size** | {original_quality.get('size_mb')} MB\n"
-        f"🏆 **VQ Score (approx.)** | {vq_score(original_quality.get('bitrate_mbps'), original_quality.get('height'))}"
+        f"🌐 **რეზოლუცია** | {original_quality.get('width')}x{original_quality.get('height')}\n"
+        f"📦 **კოდეკი** | {original_quality.get('codec')}\n"
+        f"📶 **ბიტრეიტი** | {original_quality.get('bitrate_mbps')} Mbps\n"
+        f"💾 **ზომა** | {original_quality.get('size_mb')} MB\n"
+        f"🏆 **VQ ქულა (დაახლ.)** | {vq_score(original_quality.get('bitrate_mbps'), original_quality.get('height'))}"
     )
-    embed.add_field(name="✨ Quality", value=q, inline=False)
+    embed.add_field(name="✨ ხარისხი", value=q, inline=False)
 
-    embed.add_field(name="📂 Categories (guessed)", value="\n".join(f"| {c}" for c in categories), inline=False)
+    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value="\n".join(f"| {c}" for c in categories), inline=False)
 
     embed.set_footer(text="MOON TIKTOK VIDEO CHECKER")
     return embed
