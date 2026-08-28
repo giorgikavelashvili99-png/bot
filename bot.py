@@ -330,7 +330,7 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
 
     embed.add_field(name="📂 Categories (guessed)", value="\n".join(f"| {c}" for c in categories), inline=False)
 
-    embed.set_footer(text="re:TT Checker & Downloader")
+    embed.set_footer(text="MOON TIKTOK VIDEO CHECKER")
     return embed
 
 
