@@ -471,4 +471,97 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
             if meta_plain.get("size"):
                 meta["size"] = meta_plain["size"]
     except Exception:
-        pass  # bes
+        pass  # best-effort only -- keep the hd=1 result if this fails
+
+    sources = await probe_all_sources(meta)
+    shadow = estimate_shadow_ban(meta)
+
+    if not sources:
+        raise RuntimeError("tikwm-მ ვერცერთი ვიდეო ლინკი ვერ დააბრუნა")
+
+    # "Original" = whichever detected source has the tallest short-side
+    # resolution. Its size_mb/bitrate_mbps already came straight from
+    # tikwm's own metadata inside probe_all_sources — no extra network
+    # round-trip needed here.
+    best_label, best_url, best_quality = max(
+        sources,
+        key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0),
+    )
+
+    original_quality = best_quality
+    if original_quality.get("size_mb") is None or original_quality.get("bitrate_mbps") is None:
+        # Rare fallback: tikwm didn't give us a usable size/duration for this
+        # tier, so fall back to a real download + ffprobe rather than
+        # showing a blank/zero value.
+        original_quality = await probe_video(best_url)
+
+    return build_embed(meta, sources, original_quality, shadow)
+
+
+@tree.command(name="check", description="TikTok ვიდეოს ანალიტიკის შემოწმება")
+@app_commands.describe(url="TikTok ვიდეოს ლინკი")
+async def check(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+
+    if not TIKTOK_URL_RE.search(url):
+        await interaction.followup.send("ეს არ ჰგავს TikTok-ის ლინკს.")
+        return
+
+    try:
+        embed = await analyze_tiktok_url(url)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"შეცდომა: `{e}`")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore the bot's own messages / other bots to avoid loops.
+    if message.author.bot:
+        return
+
+    match = TIKTOK_URL_RE.search(message.content)
+    if match:
+        url = match.group(0)
+        async with message.channel.typing():
+            try:
+                embed = await analyze_tiktok_url(url)
+                await message.reply(embed=embed, mention_author=False)
+            except Exception as e:
+                await message.reply(f"შეცდომა: `{e}`", mention_author=False)
+
+    # Keep prefix commands (if any get added later) working.
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"Logged in as {bot.user}")
+
+
+if __name__ == "__main__":
+    print("[startup] bot.py loaded, discord.py module import OK, python process alive.", flush=True)
+    if not DISCORD_TOKEN:
+        raise SystemExit("Set DISCORD_BOT_TOKEN environment variable before running.")
+    print(f"[startup] DISCORD_BOT_TOKEN found (length={len(DISCORD_TOKEN)}, starts with '{DISCORD_TOKEN[:6]}...').", flush=True)
+
+    import logging
+    import sys
+    # Route discord.py's own connection/handshake/retry logs to stdout at
+    # INFO level -- these normally go out via the `logging` module (not
+    # print), so if discord.py is silently retrying a failed handshake or
+    # hitting a privileged-intents error, this makes sure it's visible here
+    # instead of only existing in a stream we might not be capturing.
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("[discord.py] %(asctime)s %(levelname)s %(name)s: %(message)s"))
+
+    print("[startup] calling bot.run() now -- next line should be discord.py's own connection logs...", flush=True)
+    try:
+        bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.INFO)
+    except Exception:
+        import traceback
+        print("[startup] bot.run() raised an exception -- full traceback below:", flush=True)
+        traceback.print_exc()
+        raise
+    print("[startup] bot.run() returned on its own -- this should never happen while the bot is meant to stay alive.", flush=True)
