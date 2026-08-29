@@ -332,7 +332,6 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
 
     info = (
         f"• 🆔 **ID** | `{meta.get('id')}`\n"
-        f"• 📥 **წყარო** | ბრაუზერი\n"
         f"• 📍 **რეგიონი** | {meta.get('region', '??')}\n"
         f"• 👻 **შადოუბანი** | {shadow}"
     )
@@ -342,12 +341,8 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
         f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
         for label, _url, q in sources
     )
-    best_label, _best_url, best_probed = max(
-        sources, key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0)
-    )
-    best_tag = short_quality_label(best_probed.get("width"), best_probed.get("height"), best_probed.get("fps"))
+    best_tag = short_quality_label(original_quality.get("width"), original_quality.get("height"), original_quality.get("fps"))
     quote_block = (
-        f"> {best_label}\n"
         f"> {best_tag} • {original_quality.get('bitrate_mbps')} Mbps • "
         f"{original_quality.get('codec')} • {original_quality.get('size_mb')} MB"
     )
