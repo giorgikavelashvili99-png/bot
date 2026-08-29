@@ -56,11 +56,18 @@ TIKTOK_URL_RE = re.compile(
 )
 
 
-async def fetch_tikwm(url: str) -> dict:
+async def fetch_tikwm(url: str, hd: bool = True) -> dict:
     # hd=1 is required or tikwm leaves "hdplay" empty/duplicate-of-SD, which
-    # was silently hiding the real HD (e.g. 1080p) tier.
+    # was silently hiding the real HD (e.g. 1080p) tier. But hd=1 sometimes
+    # also inflates "play" (the SD link) to point at that same high-res
+    # file, which is why SD/HD/WM can all show identical resolutions for
+    # some videos. Callers that need the genuine lowest-quality link should
+    # also fetch with hd=False and compare.
     async with aiohttp.ClientSession() as session:
-        async with session.get(TIKWM_API, params={"url": url, "hd": "1"}, timeout=20) as resp:
+        params = {"url": url}
+        if hd:
+            params["hd"] = "1"
+        async with session.get(TIKWM_API, params=params, timeout=20) as resp:
             data = await resp.json()
     if data.get("code") != 0:
         raise RuntimeError(data.get("msg", "tikwm lookup failed"))
@@ -390,7 +397,22 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
     """Runs the full analytics + quality pipeline for one TikTok URL and
     returns the finished embed. Shared by both the /check command and the
     auto-reply on_message listener, so behavior stays identical either way."""
-    meta = await fetch_tikwm(url)
+    meta = await fetch_tikwm(url)  # hd=1 -- reliable HD tier + all stats/author fields
+
+    # tikwm's "play" (SD) link sometimes gets inflated to the same file as
+    # "hdplay" once hd=1 is set. A second, plain call sometimes reveals a
+    # genuinely lower-resolution "play" link -- when it differs, we prefer
+    # it as the true SD tier. (If it's identical, this video simply doesn't
+    # have a separate low-res download on tikwm's side -- not something we
+    # can fix from our end, since we only have what tikwm gives us.)
+    try:
+        meta_plain = await fetch_tikwm(url, hd=False)
+        if meta_plain.get("play") and meta_plain["play"] != meta.get("play"):
+            meta["play"] = meta_plain["play"]
+            if meta_plain.get("size"):
+                meta["size"] = meta_plain["size"]
+    except Exception:
+        pass  # best-effort only -- keep the hd=1 result if this fails
 
     sources = await probe_all_sources(meta)
     shadow = estimate_shadow_ban(meta)
