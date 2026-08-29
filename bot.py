@@ -320,37 +320,48 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     if thumb:
         embed.set_thumbnail(url=thumb)
 
-    embed.add_field(name="👁 ნახვა", value=f"{meta.get('play_count', 0):,}", inline=True)
-    embed.add_field(name="♡ მოწონება", value=f"{meta.get('digg_count', 0):,}", inline=True)
-    embed.add_field(name="💬 კომენტარი", value=f"{meta.get('comment_count', 0):,}", inline=True)
-    embed.add_field(name="↗ გაზიარება", value=f"{meta.get('share_count', 0):,}", inline=True)
-    embed.add_field(name="⭐ ფავორიტი", value=f"{meta.get('collect_count', 0):,}", inline=True)
-    embed.add_field(name="⬇ ჩამოტვირთვა", value=f"{meta.get('download_count', 0):,}", inline=True)
+    stats = (
+        f"• 👁 **{meta.get('play_count', 0):,}** ნახვა\n"
+        f"• ♡ **{meta.get('digg_count', 0):,}** მოწონება\n"
+        f"• 💬 **{meta.get('comment_count', 0):,}** კომენტარი\n"
+        f"• 🔖 **{meta.get('collect_count', 0):,}** ფავორიტი\n"
+        f"• ↗ **{meta.get('share_count', 0):,}** გაზიარება\n"
+        f"• ⬇ **{meta.get('download_count', 0):,}** ჩამოტვირთვა"
+    )
+    embed.add_field(name="📊 სტატისტიკა", value=stats, inline=False)
 
     info = (
-        f"**ID** | `{meta.get('id')}`\n"
-        f"**რეგიონი** | {meta.get('region', '??')}\n"
-        f"**შადოუბანი** | {shadow}"
+        f"• 🆔 **ID** | `{meta.get('id')}`\n"
+        f"• 📥 **წყარო** | ბრაუზერი\n"
+        f"• 📍 **რეგიონი** | {meta.get('region', '??')}\n"
+        f"• 👻 **შადოუბანი** | {shadow}"
     )
     embed.add_field(name="ℹ️ ინფორმაცია", value=info, inline=False)
 
     tier_lines = "\n".join(
-        f"{label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
+        f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
         for label, _url, q in sources
     )
+    best_label, _best_url, best_probed = max(
+        sources, key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0)
+    )
+    best_tag = short_quality_label(best_probed.get("width"), best_probed.get("height"), best_probed.get("fps"))
+    quote_block = (
+        f"> {best_label}\n"
+        f"> {best_tag} • {original_quality.get('bitrate_mbps')} Mbps • "
+        f"{original_quality.get('codec')} • {original_quality.get('size_mb')} MB"
+    )
     q = (
-        f"{tier_lines}\n"
-        f"🌐 **რეზოლუცია** | {original_quality.get('width')}x{original_quality.get('height')}\n"
-        f"📦 **კოდეკი** | {original_quality.get('codec')}\n"
-        f"📶 **ბიტრეიტი** | {original_quality.get('bitrate_mbps')} Mbps\n"
-        f"💾 **ზომა** | {original_quality.get('size_mb')} MB\n"
-        f"🏆 **VQ ქულა (დაახლ.)** | {vq_score(original_quality.get('bitrate_mbps'), original_quality.get('height'))}"
+        f"{tier_lines}\n\n"
+        f"{quote_block}\n\n"
+        f"**Original** | {original_quality.get('width')}x{original_quality.get('height')}\n"
+        f"**VQ Score** | {vq_score(original_quality.get('bitrate_mbps'), original_quality.get('height'))}"
     )
     embed.add_field(name="✨ ხარისხი", value=q, inline=False)
 
-    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value=" • ".join(categories), inline=False)
+    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value="\n".join(categories), inline=False)
 
-    embed.set_footer(text="MOON TIKTOK VIDEO CHECKER")
+    embed.set_footer(text="⚡ MOON TIKTOK VIDEO CHECKER")
     return embed
 
 
