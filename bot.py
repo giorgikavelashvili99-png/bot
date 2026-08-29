@@ -5,16 +5,21 @@ Fetches TikTok video analytics + real quality data and posts a styled embed.
 Data sources / honesty notes:
 - Views, Likes, Comments, Shares, Favorites, ID, Region -> REAL, from tikwm.com's
   public TikTok API (no official TikTok API key needed).
-- Quality (resolution, bitrate, codec, file size) -> REAL, obtained by downloading
-  the video via tikwm's direct link and probing it with ffprobe.
+- Resolution/fps/codec -> REAL, from a lightweight remote ffprobe (reads only
+  the header tikwm's CDN serves, no full download needed).
+- File size & bitrate -> REAL, taken directly from tikwm's own metadata
+  (size/hd_size/wm_size + duration) instead of a HEAD request or full
+  download, since some CDNs don't reliably answer HEAD with Content-Length.
+  Falls back to a full download + ffprobe only if tikwm didn't provide a
+  size for that tier.
 - Shadow ban -> HEURISTIC ONLY. TikTok exposes no official "shadow ban" flag.
-  This bot approximates it by checking whether the video is discoverable via
-  TikTok's public hashtag/keyword search for one of its own hashtags. This is
-  not authoritative.
+  This bot approximates it from the like-count vs. view-count relationship:
+  very few likes on a video with real reach is a classic shadowban symptom,
+  while healthy like counts read as "not shadowbanned". This is not
+  authoritative, and the middle ground is reported as unknown rather than
+  guessed.
 - VQ Score -> HEURISTIC ONLY (invented). Computed from bitrate + resolution as a
   rough proxy, 0-100. Not an official TikTok metric.
-- Categories -> HEURISTIC ONLY. Guessed from hashtags/caption keywords via a
-  small local keyword map. Not TikTok's own classification.
 """
 
 import os
@@ -49,29 +54,6 @@ tree = bot.tree
 TIKTOK_URL_RE = re.compile(
     r"https?://(?:www\.|vt\.|vm\.)?tiktok\.com/\S+", re.IGNORECASE
 )
-
-# --- crude keyword -> category map (heuristic, not TikTok's real classifier) ---
-CATEGORY_KEYWORDS = {
-    "ფილმები და სერიალები": ["movie", "film", "series", "tvshow", "goldberg", "you", "netflix"],
-    "გასართობი კულტურა": ["edit", "viral", "fyp", "trend", "meme"],
-    "გართობა": [],  # fallback bucket, always included if nothing else matches strongly
-    "მუსიკა": ["song", "music", "sound", "remix", "dj"],
-    "სპორტი": ["football", "basketball", "soccer", "nba", "sport"],
-    "კომედია": ["funny", "comedy", "lol", "joke"],
-}
-
-
-def guess_categories(caption: str) -> list[str]:
-    caption_l = caption.lower()
-    hits = []
-    for cat, kws in CATEGORY_KEYWORDS.items():
-        if any(kw in caption_l for kw in kws):
-            hits.append(cat)
-    if not hits:
-        hits = ["გართობა"]
-    elif "გართობა" not in hits and len(hits) < 2:
-        hits.append("გართობა")
-    return hits[:3]
 
 
 async def fetch_tikwm(url: str) -> dict:
@@ -131,20 +113,6 @@ async def probe_remote(video_url: str) -> dict:
         "size_mb": None,
         "fps": fps,
     }
-
-
-async def get_remote_size(video_url: str) -> int | None:
-    """Ask the CDN for Content-Length via HEAD — gives the exact file size
-    without transferring any video bytes. Much faster than a full download,
-    but some CDNs don't answer HEAD requests reliably, so callers should
-    fall back to probe_video() if this returns None."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(video_url, timeout=10, allow_redirects=True) as resp:
-                cl = resp.headers.get("Content-Length")
-                return int(cl) if cl and cl.isdigit() else None
-    except Exception:
-        return None
 
 
 async def probe_video(video_url: str) -> dict:
@@ -252,10 +220,12 @@ def resolution_only_label(width: int | None, height: int | None) -> str:
     return f"{short_side}p"
 
 
-def vq_score(bitrate_mbps: float | None, height: int | None) -> int:
-    """Invented 0-100 proxy score. Not an official TikTok metric."""
-    if not bitrate_mbps or not height:
-        return 0
+def vq_score(bitrate_mbps: float | None, height: int | None) -> int | None:
+    """Invented 0-100 proxy score. Not an official TikTok metric.
+    Returns None (rendered as '?') when we don't actually have bitrate/height
+    data, instead of silently showing a 0 that looks like a real bad score."""
+    if bitrate_mbps is None or height is None:
+        return None
     score = min(100, round((bitrate_mbps / 15) * 60 + (height / 2880) * 40))
     return max(0, score)
 
@@ -272,16 +242,34 @@ QUALITY_SOURCES = [
     ("💧 WM", "wmplay"),
 ]
 
+# tikwm returns an exact byte size directly in its JSON for each quality
+# tier — no need to HEAD or download the file just to learn its size, and
+# unlike a HEAD request this always works, even on CDNs that don't answer
+# HEAD with a Content-Length header.
+SIZE_KEYS = {
+    "play": "size",
+    "hdplay": "hd_size",
+    "wmplay": "wm_size",
+}
+
 
 async def probe_all_sources(meta: dict) -> list[tuple[str, str, dict]]:
     """Probe every distinct quality URL tikwm returned. If two labels point
     at the same URL (common — e.g. hdplay falls back to play) they're
-    merged into one combined label so we don't probe or display duplicates."""
+    merged into one combined label so we don't probe or display duplicates.
+
+    Resolution/fps/codec come from a lightweight remote ffprobe (header read
+    only). Size and bitrate come straight from tikwm's own metadata, which
+    is what actually fixes the "0.0Mbps / 0.0MB" bug — a HEAD-based Content-
+    Length lookup was unreliable, and computing bitrate off it (or off a
+    tikwm size of 0) could previously round down to a misleading 0.0."""
     labels_by_url: dict[str, list[str]] = {}
+    keys_by_url: dict[str, list[str]] = {}
     for label, key in QUALITY_SOURCES:
         url = meta.get(key)
         if url:
             labels_by_url.setdefault(url, []).append(label)
+            keys_by_url.setdefault(url, []).append(key)
 
     urls = list(labels_by_url.keys())
     if not urls:
@@ -289,34 +277,54 @@ async def probe_all_sources(meta: dict) -> list[tuple[str, str, dict]]:
 
     qualities = await asyncio.gather(*(probe_remote(u) for u in urls))
 
-    return [
-        (" / ".join(labels_by_url[url]), url, quality)
-        for url, quality in zip(urls, qualities)
-    ]
+    duration = meta.get("duration") or 0
+    results = []
+    for url, quality in zip(urls, qualities):
+        size_bytes = None
+        for key in keys_by_url[url]:
+            candidate = meta.get(SIZE_KEYS.get(key, ""))
+            if candidate:
+                size_bytes = candidate
+                break
+        if size_bytes and duration:
+            quality["size_mb"] = round(size_bytes / (1024 * 1024), 1)
+            quality["bitrate_mbps"] = round((size_bytes * 8 / duration) / 1_000_000, 1)
+        results.append((" / ".join(labels_by_url[url]), url, quality))
+    return results
 
 
-async def check_shadow_ban(hashtag: str, video_id: str) -> str:
-    """Best-effort heuristic: search TikTok's public hashtag feed via tikwm and
-    see if this video id shows up. NOT authoritative — many legit videos won't
-    appear for unrelated reasons (recency, ranking, region)."""
-    if not hashtag:
-        return "უცნობია"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://www.tikwm.com/api/challenge/videos",
-                params={"challenge_name": hashtag, "count": 30},
-                timeout=15,
-            ) as resp:
-                data = await resp.json()
-        videos = data.get("data", {}).get("videos", [])
-        found = any(str(v.get("video_id")) == str(video_id) for v in videos)
-        return "არა" if found else "შესაძლოა (ჰეშტეგის ფიდში ვერ მოიძებნა)"
-    except Exception:
-        return "უცნობია"
+# Tunable thresholds for the shadow-ban heuristic below.
+SHADOW_BAN_HIGH_LIKES = 50      # this many likes (or more) reads as healthy engagement -> NO
+SHADOW_BAN_LOW_LIKES = 5        # this many likes (or fewer) is suspicious -> possible YES
+SHADOW_BAN_MIN_VIEWS = 1000     # ...but only counts as suspicious once there's real reach to begin with
 
 
-def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quality: dict, shadow: str, categories: list[str]) -> discord.Embed:
+def estimate_shadow_ban(meta: dict) -> str:
+    """HEURISTIC ONLY. TikTok exposes no official "shadow ban" flag.
+    A video with real reach (views) but almost no likes is a classic
+    shadowban symptom — the algorithm is technically showing it but
+    engagement/discovery is being suppressed. A video with a healthy like
+    count is almost certainly not shadowbanned. Anything in between is
+    genuinely ambiguous, so this reports "unknown" there rather than
+    guessing."""
+    views = meta.get("play_count", 0) or 0
+    likes = meta.get("digg_count", 0) or 0
+
+    if likes >= SHADOW_BAN_HIGH_LIKES:
+        return "NO"
+    if likes <= SHADOW_BAN_LOW_LIKES and views >= SHADOW_BAN_MIN_VIEWS:
+        return "YES"
+    return "უცნობია"
+
+
+def _fmt(value, suffix: str = "") -> str:
+    """Render a possibly-missing numeric value without ever printing a bare
+    'None' — shows '?' instead so it's visually obvious the data is missing,
+    rather than looking like a real (bad) measurement."""
+    return f"{value}{suffix}" if value is not None else "?"
+
+
+def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quality: dict, shadow: str) -> discord.Embed:
     author = meta.get("author", {})
     title = meta.get("title", "")
     created_utc = datetime.fromtimestamp(meta.get("create_time", 0), tz=timezone.utc)
@@ -349,30 +357,30 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     embed.add_field(name="📊 სტატისტიკა", value=stats, inline=False)
 
     info = (
-        f"• 🆔 **ID** | `{meta.get('id')}`\n"
+        f"• 🆔 | `{meta.get('id')}`\n"
         f"• 📍 **რეგიონი** | {meta.get('region', '??')}\n"
-        f"• 👻 **შადოუბანი** | {shadow}"
+        f"• 👻 | {shadow}"
     )
     embed.add_field(name="ℹ️ ინფორმაცია", value=info, inline=False)
 
     tier_lines = "\n".join(
         f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
+        f" • {_fmt(q.get('bitrate_mbps'), 'Mbps')} • {_fmt(q.get('size_mb'), 'MB')}"
         for label, _url, q in sources
     )
     best_res = resolution_only_label(original_quality.get("width"), original_quality.get("height"))
     quote_block = (
-        f"> {best_res} • {original_quality.get('bitrate_mbps')}Mbps • "
-        f"{original_quality.get('codec')} • {original_quality.get('size_mb')}MB"
+        f"> {best_res} • {_fmt(original_quality.get('bitrate_mbps'), 'Mbps')} • "
+        f"{original_quality.get('codec')} • {_fmt(original_quality.get('size_mb'), 'MB')}"
     )
+    vq = vq_score(original_quality.get("bitrate_mbps"), original_quality.get("height"))
     q = (
         f"{tier_lines}\n\n"
         f"{quote_block}\n\n"
         f"**Original** | {original_quality.get('width')}x{original_quality.get('height')}\n"
-        f"**VQ Score** | {vq_score(original_quality.get('bitrate_mbps'), original_quality.get('height'))}"
+        f"**VQ Score** | {_fmt(vq)}"
     )
     embed.add_field(name="✨ ხარისხი", value=q, inline=False)
-
-    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value="\n".join(categories), inline=False)
 
     embed.set_footer(text="⚡ MOON TIKTOK VIDEO CHECKER")
     return embed
@@ -384,58 +392,29 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
     auto-reply on_message listener, so behavior stays identical either way."""
     meta = await fetch_tikwm(url)
 
-    caption = meta.get("title", "")
-    hashtag_match = re.findall(r"#(\w+)", caption)
-
-    sources, shadow = await asyncio.gather(
-        probe_all_sources(meta),
-        check_shadow_ban(hashtag_match[0] if hashtag_match else "", meta.get("id")),
-    )
+    sources = await probe_all_sources(meta)
+    shadow = estimate_shadow_ban(meta)
 
     if not sources:
         raise RuntimeError("tikwm-მ ვერცერთი ვიდეო ლინკი ვერ დააბრუნა")
 
-    # Full download (for exact size/bitrate) only on whichever detected
-    # source has the tallest short-side resolution — skips redundant
-    # downloads of the lower tiers.
+    # "Original" = whichever detected source has the tallest short-side
+    # resolution. Its size_mb/bitrate_mbps already came straight from
+    # tikwm's own metadata inside probe_all_sources — no extra network
+    # round-trip needed here.
     best_label, best_url, best_quality = max(
         sources,
         key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0),
     )
 
-    # Fast path: a HEAD request gets the exact file size without downloading
-    # any video bytes, and tikwm already gives us the clip's duration — so we
-    # can compute bitrate from size/duration instead of doing a full download
-    # + ffprobe just to learn the size. Falls back to the slow full-download
-    # probe whenever the fast path can't fully compute BOTH size and bitrate
-    # (e.g. the CDN doesn't answer HEAD with Content-Length, or tikwm didn't
-    # give us a duration) — so those fields are never left blank.
-    size_bytes = await get_remote_size(best_url)
-    duration = meta.get("duration") or 0
-
-    bitrate_mbps = None
-    size_mb = None
-    if size_bytes and duration:
-        bitrate_mbps = round((size_bytes * 8 / duration) / 1_000_000, 1)
-        size_mb = round(size_bytes / (1024 * 1024), 1)
-    elif size_bytes and best_quality.get("bitrate_mbps"):
-        bitrate_mbps = best_quality.get("bitrate_mbps")
-        size_mb = round(size_bytes / (1024 * 1024), 1)
-
-    if bitrate_mbps is not None and size_mb is not None:
-        original_quality = {
-            "width": best_quality.get("width"),
-            "height": best_quality.get("height"),
-            "codec": best_quality.get("codec"),
-            "bitrate_mbps": bitrate_mbps,
-            "size_mb": size_mb,
-            "fps": best_quality.get("fps"),
-        }
-    else:
+    original_quality = best_quality
+    if original_quality.get("size_mb") is None or original_quality.get("bitrate_mbps") is None:
+        # Rare fallback: tikwm didn't give us a usable size/duration for this
+        # tier, so fall back to a real download + ffprobe rather than
+        # showing a blank/zero value.
         original_quality = await probe_video(best_url)
-    categories = guess_categories(caption)
 
-    return build_embed(meta, sources, original_quality, shadow, categories)
+    return build_embed(meta, sources, original_quality, shadow)
 
 
 @tree.command(name="check", description="TikTok ვიდეოს ანალიტიკის შემოწმება")
