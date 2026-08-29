@@ -23,7 +23,7 @@ import io
 import asyncio
 import tempfile
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import discord
@@ -35,6 +35,11 @@ load_dotenv(override=True)  # .env always wins over any stray session variable
 
 TIKWM_API = "https://www.tikwm.com/api/"
 DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+
+# Georgia is a fixed UTC+4 offset year-round (no daylight saving), so we
+# convert timestamps explicitly here rather than relying on Discord's
+# client-side auto-localization, which wasn't matching for this server.
+GEORGIA_TZ = timezone(timedelta(hours=4))
 
 intents = discord.Intents.default()
 intents.message_content = True  # required to read link text in normal messages
@@ -296,35 +301,36 @@ async def check_shadow_ban(hashtag: str, video_id: str) -> str:
 def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quality: dict, shadow: str, categories: list[str]) -> discord.Embed:
     author = meta.get("author", {})
     title = meta.get("title", "")
-    created = datetime.fromtimestamp(meta.get("create_time", 0), tz=timezone.utc)
+    created_utc = datetime.fromtimestamp(meta.get("create_time", 0), tz=timezone.utc)
+    created_local = created_utc.astimezone(GEORGIA_TZ)
 
     embed = discord.Embed(
-        title="🎬 ვიდეო • ანალიტიკა",
+        title="🎬 ვიდეო ანალიტიკა",
+        description=f"📅 {created_local.strftime('%d %B %Y, %H:%M:%S')}\n> {title}\n🎵 {meta.get('music_info', {}).get('title', 'ორიგინალი ხმა')}",
         color=0x1DA1F2,
     )
-    embed.set_author(name=f"👤 {author.get('nickname', author.get('unique_id', 'უცნობი'))}")
 
-    embed.add_field(
-        name="\u200b",
-        value=f"📅 {created.strftime('%d %B %Y, %H:%M:%S')}\n> {title}\n🎵 {meta.get('music_info', {}).get('title', 'ორიგინალი ხმა')}",
-        inline=False,
-    )
+    author_kwargs = {"name": author.get("nickname", author.get("unique_id", "უცნობი"))}
+    avatar = author.get("avatar_medium") or author.get("avatar_thumb") or author.get("avatar_larger")
+    if avatar:
+        author_kwargs["icon_url"] = avatar
+    embed.set_author(**author_kwargs)
 
-    stats = (
-        f"👁 **{meta.get('play_count', 0):,} ნახვა**\n"
-        f"♡ **{meta.get('digg_count', 0):,} მოწონება**\n"
-        f"💬 **{meta.get('comment_count', 0):,} კომენტარი**\n"
-        f"⭐ **{meta.get('collect_count', 0):,} ფავორიტი**\n"
-        f"↗ **{meta.get('share_count', 0):,} გაზიარება**\n"
-        f"⬇ **{meta.get('download_count', 0):,} ჩამოტვირთვა**"
-    )
-    embed.add_field(name="📊 სტატისტიკა", value=stats, inline=False)
+    thumb = meta.get("origin_cover") or meta.get("cover") or meta.get("ai_dynamic_cover")
+    if thumb:
+        embed.set_thumbnail(url=thumb)
+
+    embed.add_field(name="👁 ნახვა", value=f"{meta.get('play_count', 0):,}", inline=True)
+    embed.add_field(name="♡ მოწონება", value=f"{meta.get('digg_count', 0):,}", inline=True)
+    embed.add_field(name="💬 კომენტარი", value=f"{meta.get('comment_count', 0):,}", inline=True)
+    embed.add_field(name="↗ გაზიარება", value=f"{meta.get('share_count', 0):,}", inline=True)
+    embed.add_field(name="⭐ ფავორიტი", value=f"{meta.get('collect_count', 0):,}", inline=True)
+    embed.add_field(name="⬇ ჩამოტვირთვა", value=f"{meta.get('download_count', 0):,}", inline=True)
 
     info = (
-        f"🆔 **ID** | `{meta.get('id')}`\n"
-        f"📡 **წყარო** | ბრაუზერი\n"
-        f"📍 **რეგიონი** | {meta.get('region', '??')}\n"
-        f"🚫 **შადოუბანი** | {shadow}"
+        f"**ID** | `{meta.get('id')}`\n"
+        f"**რეგიონი** | {meta.get('region', '??')}\n"
+        f"**შადოუბანი** | {shadow}"
     )
     embed.add_field(name="ℹ️ ინფორმაცია", value=info, inline=False)
 
@@ -342,7 +348,7 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     )
     embed.add_field(name="✨ ხარისხი", value=q, inline=False)
 
-    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value="\n".join(f"| {c}" for c in categories), inline=False)
+    embed.add_field(name="📂 კატეგორიები (სავარაუდო)", value=" • ".join(categories), inline=False)
 
     embed.set_footer(text="MOON TIKTOK VIDEO CHECKER")
     return embed
@@ -377,20 +383,28 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
     # any video bytes, and tikwm already gives us the clip's duration — so we
     # can compute bitrate from size/duration instead of doing a full download
     # + ffprobe just to learn the size. Falls back to the slow full-download
-    # probe only if the CDN doesn't answer HEAD with a usable Content-Length.
+    # probe whenever the fast path can't fully compute BOTH size and bitrate
+    # (e.g. the CDN doesn't answer HEAD with Content-Length, or tikwm didn't
+    # give us a duration) — so those fields are never left blank.
     size_bytes = await get_remote_size(best_url)
     duration = meta.get("duration") or 0
 
-    if size_bytes:
-        bitrate_mbps = (
-            round((size_bytes * 8 / duration) / 1_000_000, 1) if duration else best_quality.get("bitrate_mbps")
-        )
+    bitrate_mbps = None
+    size_mb = None
+    if size_bytes and duration:
+        bitrate_mbps = round((size_bytes * 8 / duration) / 1_000_000, 1)
+        size_mb = round(size_bytes / (1024 * 1024), 1)
+    elif size_bytes and best_quality.get("bitrate_mbps"):
+        bitrate_mbps = best_quality.get("bitrate_mbps")
+        size_mb = round(size_bytes / (1024 * 1024), 1)
+
+    if bitrate_mbps is not None and size_mb is not None:
         original_quality = {
             "width": best_quality.get("width"),
             "height": best_quality.get("height"),
             "codec": best_quality.get("codec"),
             "bitrate_mbps": bitrate_mbps,
-            "size_mb": round(size_bytes / (1024 * 1024), 1),
+            "size_mb": size_mb,
             "fps": best_quality.get("fps"),
         }
     else:
