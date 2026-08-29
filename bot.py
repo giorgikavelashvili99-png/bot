@@ -92,18 +92,35 @@ async def probe_remote(video_url: str) -> dict:
     means ffprobe sometimes can't see enough of the stream over a plain HTTP
     header read), so we ask for avg_frame_rate too and fall back to it, and
     we bump probesize/analyzeduration so ffprobe reads enough of the stream
-    to find frame timing info at all."""
+    to find frame timing info at all.
+
+    Wrapped defensively: some tikwm links (notably the watermarked one,
+    which tikwm renders on demand rather than serving a pre-made file) can
+    be slow enough to hit ffprobe's timeout. A single slow/failing tier
+    used to raise here and crash the whole /check for every tier at once —
+    now it just comes back as an all-unknown result for that one tier."""
+    empty = {"width": None, "height": None, "codec": None, "bitrate_mbps": None, "size_mb": None, "fps": None}
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-probesize", "10000000", "-analyzeduration", "10000000",
         "-show_entries", "stream=width,height,codec_name,bit_rate,r_frame_rate,avg_frame_rate",
         "-of", "csv=p=0", video_url,
     ]
-    out = await asyncio.to_thread(
-        subprocess.run, cmd, capture_output=True, text=True, timeout=25
-    )
+    try:
+        out = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True, timeout=25
+        )
+    except Exception:
+        return dict(empty)
+
     parts = out.stdout.strip().split(",")
-    codec_name = parts[0] if len(parts) > 0 else "unknown"
+    if not parts or not parts[0]:
+        # ffprobe ran but couldn't read the stream at all (e.g. the CDN
+        # returned an error page instead of video) -- previously this fell
+        # through to codec_name="" instead of a clean "unknown" state.
+        return dict(empty)
+
+    codec_name = parts[0]
     width = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
     height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
     bitrate = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
@@ -125,7 +142,11 @@ async def probe_remote(video_url: str) -> dict:
 async def probe_video(video_url: str) -> dict:
     """Download the video to a temp file and run ffprobe on it for real
     resolution / bitrate / codec / size / fps — used once, on the highest
-    quality source, so the 'Size' stat is an exact file size."""
+    quality source, so the 'Size' stat is an exact file size.
+
+    ffprobe failures here are caught and degrade to partial data instead of
+    raising and failing the whole check — size_mb always comes from the
+    already-downloaded bytes regardless of whether ffprobe itself succeeds."""
     async with aiohttp.ClientSession() as session:
         async with session.get(video_url, timeout=60) as resp:
             raw = await resp.read()
@@ -134,45 +155,52 @@ async def probe_video(video_url: str) -> dict:
         f.write(raw)
         path = f.name
 
+    size_bytes = len(raw)
+    width = height = bitrate = None
+    codec_name = None
+    fps = None
+
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,codec_name,bit_rate,r_frame_rate,avg_frame_rate",
-            "-of", "csv=p=0", path,
-        ]
-        out = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=30
-        )
-        parts = out.stdout.strip().split(",")
-        codec_name = parts[0] if len(parts) > 0 else "unknown"
-        width = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-        height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-        bitrate = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
+        try:
+            cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,codec_name,bit_rate,r_frame_rate,avg_frame_rate",
+                "-of", "csv=p=0", path,
+            ]
+            out = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=30
+            )
+            parts = out.stdout.strip().split(",")
+            if parts and parts[0]:
+                codec_name = parts[0]
+                width = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+                bitrate = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None
+                fps = _parse_fraction(parts[4]) if len(parts) > 4 else None
+                if not fps:
+                    fps = _parse_fraction(parts[5]) if len(parts) > 5 else None
+        except Exception:
+            pass  # size_mb below still works even if ffprobe itself fails
 
-        fps = _parse_fraction(parts[4]) if len(parts) > 4 else None
-        if not fps:
-            fps = _parse_fraction(parts[5]) if len(parts) > 5 else None
-
-        size_bytes = len(raw)
         bitrate_mbps = round(bitrate / 1_000_000, 1) if bitrate else None
 
         if bitrate_mbps is None:
             # Some mp4 muxers don't write a per-stream bit_rate at all, so
             # fall back to computing it from file size / duration instead
             # of just showing "None".
-            dur_cmd = [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "csv=p=0", path,
-            ]
-            dur_out = await asyncio.to_thread(
-                subprocess.run, dur_cmd, capture_output=True, text=True, timeout=15
-            )
             try:
+                dur_cmd = [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", path,
+                ]
+                dur_out = await asyncio.to_thread(
+                    subprocess.run, dur_cmd, capture_output=True, text=True, timeout=15
+                )
                 duration = float(dur_out.stdout.strip())
                 if duration > 0:
                     bitrate_mbps = round((size_bytes * 8 / duration) / 1_000_000, 1)
-            except ValueError:
+            except Exception:
                 pass
 
         return {
@@ -260,6 +288,21 @@ SIZE_KEYS = {
 }
 
 
+async def _head_content_length(url: str) -> int | None:
+    """Best-effort fallback: ask the CDN for Content-Length via HEAD. Only
+    used when tikwm's own metadata doesn't include a size for a tier (this
+    happens on some watermarked links, which tikwm renders on demand rather
+    than serving a pre-made file with a known size). Not the primary path —
+    see SIZE_KEYS — since some CDNs don't answer HEAD reliably either."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, timeout=8, allow_redirects=True) as resp:
+                cl = resp.headers.get("Content-Length")
+                return int(cl) if cl and cl.isdigit() else None
+    except Exception:
+        return None
+
+
 async def probe_all_sources(meta: dict) -> list[tuple[str, str, dict]]:
     """Probe every distinct quality URL tikwm returned. If two labels point
     at the same URL (common — e.g. hdplay falls back to play) they're
@@ -269,7 +312,10 @@ async def probe_all_sources(meta: dict) -> list[tuple[str, str, dict]]:
     only). Size and bitrate come straight from tikwm's own metadata, which
     is what actually fixes the "0.0Mbps / 0.0MB" bug — a HEAD-based Content-
     Length lookup was unreliable, and computing bitrate off it (or off a
-    tikwm size of 0) could previously round down to a misleading 0.0."""
+    tikwm size of 0) could previously round down to a misleading 0.0. When
+    tikwm's metadata doesn't have a size for a given tier at all, we fall
+    back to a HEAD request for just that URL (run concurrently, so a slow
+    one never delays the tiers that already have real data)."""
     labels_by_url: dict[str, list[str]] = {}
     keys_by_url: dict[str, list[str]] = {}
     for label, key in QUALITY_SOURCES:
@@ -285,14 +331,27 @@ async def probe_all_sources(meta: dict) -> list[tuple[str, str, dict]]:
     qualities = await asyncio.gather(*(probe_remote(u) for u in urls))
 
     duration = meta.get("duration") or 0
-    results = []
-    for url, quality in zip(urls, qualities):
+
+    meta_sizes: list[int | None] = []
+    for url in urls:
         size_bytes = None
         for key in keys_by_url[url]:
             candidate = meta.get(SIZE_KEYS.get(key, ""))
             if candidate:
                 size_bytes = candidate
                 break
+        meta_sizes.append(size_bytes)
+
+    need_head = [url for url, sz in zip(urls, meta_sizes) if not sz]
+    head_by_url: dict[str, int | None] = {}
+    if need_head:
+        head_values = await asyncio.gather(*(_head_content_length(u) for u in need_head))
+        head_by_url = dict(zip(need_head, head_values))
+
+    results = []
+    for url, quality, size_bytes in zip(urls, qualities, meta_sizes):
+        if not size_bytes:
+            size_bytes = head_by_url.get(url)
         if size_bytes and duration:
             quality["size_mb"] = round(size_bytes / (1024 * 1024), 1)
             quality["bitrate_mbps"] = round((size_bytes * 8 / duration) / 1_000_000, 1)
@@ -371,8 +430,8 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
     embed.add_field(name="ℹ️ ინფორმაცია", value=info, inline=False)
 
     tier_lines = "\n".join(
-        f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
-        f" • {_fmt(q.get('bitrate_mbps'), 'Mbps')} • {_fmt(q.get('size_mb'), 'MB')}"
+        f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}\n"
+        f"   ↳ {_fmt(q.get('bitrate_mbps'), 'Mbps')} • {_fmt(q.get('size_mb'), 'MB')}"
         for label, _url, q in sources
     )
     best_res = resolution_only_label(original_quality.get("width"), original_quality.get("height"))
@@ -412,76 +471,4 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
             if meta_plain.get("size"):
                 meta["size"] = meta_plain["size"]
     except Exception:
-        pass  # best-effort only -- keep the hd=1 result if this fails
-
-    sources = await probe_all_sources(meta)
-    shadow = estimate_shadow_ban(meta)
-
-    if not sources:
-        raise RuntimeError("tikwm-მ ვერცერთი ვიდეო ლინკი ვერ დააბრუნა")
-
-    # "Original" = whichever detected source has the tallest short-side
-    # resolution. Its size_mb/bitrate_mbps already came straight from
-    # tikwm's own metadata inside probe_all_sources — no extra network
-    # round-trip needed here.
-    best_label, best_url, best_quality = max(
-        sources,
-        key=lambda s: min(s[2].get("width") or 0, s[2].get("height") or 0),
-    )
-
-    original_quality = best_quality
-    if original_quality.get("size_mb") is None or original_quality.get("bitrate_mbps") is None:
-        # Rare fallback: tikwm didn't give us a usable size/duration for this
-        # tier, so fall back to a real download + ffprobe rather than
-        # showing a blank/zero value.
-        original_quality = await probe_video(best_url)
-
-    return build_embed(meta, sources, original_quality, shadow)
-
-
-@tree.command(name="check", description="TikTok ვიდეოს ანალიტიკის შემოწმება")
-@app_commands.describe(url="TikTok ვიდეოს ლინკი")
-async def check(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()
-
-    if not TIKTOK_URL_RE.search(url):
-        await interaction.followup.send("ეს არ ჰგავს TikTok-ის ლინკს.")
-        return
-
-    try:
-        embed = await analyze_tiktok_url(url)
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"შეცდომა: `{e}`")
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore the bot's own messages / other bots to avoid loops.
-    if message.author.bot:
-        return
-
-    match = TIKTOK_URL_RE.search(message.content)
-    if match:
-        url = match.group(0)
-        async with message.channel.typing():
-            try:
-                embed = await analyze_tiktok_url(url)
-                await message.reply(embed=embed, mention_author=False)
-            except Exception as e:
-                await message.reply(f"შეცდომა: `{e}`", mention_author=False)
-
-    # Keep prefix commands (if any get added later) working.
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_ready():
-    await tree.sync()
-    print(f"Logged in as {bot.user}")
-
-
-if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise SystemExit("Set DISCORD_BOT_TOKEN environment variable before running.")
-    bot.run(DISCORD_TOKEN)
+        pass  # bes
