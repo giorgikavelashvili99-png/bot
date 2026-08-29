@@ -234,6 +234,24 @@ def short_quality_label(width: int | None, height: int | None, fps: int | None) 
     return f"{res} • {fps_label}"
 
 
+def resolution_only_label(width: int | None, height: int | None) -> str:
+    """Same short-side bucketing as short_quality_label but without the fps
+    suffix — used where fps is already shown elsewhere on screen and
+    repeating it would just add length that causes mobile line-wrapping."""
+    if not width or not height:
+        return "უცნობი"
+    short_side = min(width, height)
+    if short_side >= 2160:
+        return "4K"
+    elif short_side >= 1440:
+        return "2K"
+    elif short_side >= 1080:
+        return "1080p"
+    elif short_side >= 720:
+        return "720p"
+    return f"{short_side}p"
+
+
 def vq_score(bitrate_mbps: float | None, height: int | None) -> int:
     """Invented 0-100 proxy score. Not an official TikTok metric."""
     if not bitrate_mbps or not height:
@@ -249,9 +267,9 @@ def vq_score(bitrate_mbps: float | None, height: int | None) -> int:
 # (e.g. 540p / 720p / 1080p) — so we probe every *distinct* URL we're
 # given instead of assuming there are always exactly two tiers.
 QUALITY_SOURCES = [
-    ("🌐 ბრაუზერი (SD)", "play"),
-    ("📱 ტელეფონი (HD)", "hdplay"),
-    ("💧 ვოთერმარკიანი", "wmplay"),
+    ("🌐 SD", "play"),
+    ("📱 HD", "hdplay"),
+    ("💧 WM", "wmplay"),
 ]
 
 
@@ -341,10 +359,10 @@ def build_embed(meta: dict, sources: list[tuple[str, str, dict]], original_quali
         f"• {label} | {short_quality_label(q.get('width'), q.get('height'), q.get('fps'))}"
         for label, _url, q in sources
     )
-    best_tag = short_quality_label(original_quality.get("width"), original_quality.get("height"), original_quality.get("fps"))
+    best_res = resolution_only_label(original_quality.get("width"), original_quality.get("height"))
     quote_block = (
-        f"> {best_tag} • {original_quality.get('bitrate_mbps')} Mbps • "
-        f"{original_quality.get('codec')} • {original_quality.get('size_mb')} MB"
+        f"> {best_res} • {original_quality.get('bitrate_mbps')}Mbps • "
+        f"{original_quality.get('codec')} • {original_quality.get('size_mb')}MB"
     )
     q = (
         f"{tier_lines}\n\n"
