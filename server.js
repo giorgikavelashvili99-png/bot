@@ -64,6 +64,24 @@ app.post('/api/sessions', (req, res) => {
   res.json({ ok: true, orderId });
 });
 
+// Looked up right after Discord login (and on page load, if already
+// logged in) so a customer who closes the chat -- or leaves and comes
+// back later, even on a different device -- can get straight back into
+// it instead of it just vanishing. Declared BEFORE /api/sessions/:orderId
+// below, since Express would otherwise match "by-customer" as if it
+// were an :orderId value.
+app.get('/api/sessions/by-customer/:discordId', (req, res) => {
+  const discordId = req.params.discordId;
+  const active = [];
+  for (const [orderId, session] of sessions.entries()) {
+    if (session.status === 'active' && session.customer?.discordId === discordId) {
+      active.push(publicSession(orderId, session));
+    }
+  }
+  active.sort((a, b) => b.createdAt - a.createdAt);
+  res.json(active);
+});
+
 app.get('/api/sessions/:orderId', (req, res) => {
   const session = sessions.get(req.params.orderId);
   if (!session) return res.status(404).json({ error: 'not found' });
