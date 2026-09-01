@@ -47,11 +47,75 @@ try {
 // registered via POST /api/admin/fcm-token (the Android app calls this
 // once it has a token). A Set so the same device re-registering doesn't
 // create duplicates.
+//
+// Unlike active chat sessions (see the file-header comment -- those are
+// deliberately in-memory-only), this Set is mirrored to MantleDB, the
+// same simple external key-value store the site and the Android app
+// already use for other saved data. Device registrations aren't
+// transactional the way a chat session is -- there's no reasonable
+// sense in which "the server happened to restart" should make an
+// admin's phone stop receiving pushes until they think to reopen the
+// Admin tab. Render's free/hobby tier spins the service down after a
+// period of inactivity and spins a fresh instance back up on the next
+// request, wiping any plain in-memory Set -- which is exactly what
+// produced the "push arrives from the 2nd message but never the 1st"
+// pattern: the very request that wakes the server (a brand new order)
+// finds zero registered devices, because nothing yet had a chance to
+// re-register on this fresh instance.
+const MANTLEDB_BASE = 'https://mantledb.sh/v2';
+const MANTLEDB_NAMESPACE = 'moonge-tbilisi-vc7f3q';
+const FCM_TOKENS_PATH = 'chat-server-fcm-admin-tokens';
 const adminFcmTokens = new Set();
 
+async function loadPersistedFcmTokens() {
+  try {
+    const resp = await fetch(`${MANTLEDB_BASE}/${MANTLEDB_NAMESPACE}/${FCM_TOKENS_PATH}`);
+    if (resp.status === 404) {
+      console.log('[MOON] No persisted FCM tokens found yet (first run, or none ever registered).');
+      return;
+    }
+    if (!resp.ok) {
+      console.log(`[MOON] Could not load persisted FCM tokens (HTTP ${resp.status}) -- starting with an empty set; devices will need to re-register.`);
+      return;
+    }
+    const data = await resp.json();
+    const list = Array.isArray(data.list) ? data.list : [];
+    list.forEach(t => adminFcmTokens.add(t));
+    console.log(`[MOON] Restored ${list.length} FCM token(s) from persistent storage -- survives this restart, no re-registration needed.`);
+  } catch (e) {
+    console.log('[MOON] Error loading persisted FCM tokens -- starting with an empty set:', e.message);
+  }
+}
+
+async function persistFcmTokens() {
+  try {
+    await fetch(`${MANTLEDB_BASE}/${MANTLEDB_NAMESPACE}/${FCM_TOKENS_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list: Array.from(adminFcmTokens) })
+    });
+  } catch (e) {
+    console.log('[MOON] Error persisting FCM tokens (registration still works for this session, just won\'t survive a restart):', e.message);
+  }
+}
+// Kicked off later, awaited immediately before the server starts
+// accepting connections (see the bottom of this file) -- this used to
+// fire immediately here instead, which left a real (if short) window
+// where an incoming request could still find zero tokens if it arrived
+// before this finished. Not awaiting it before the server opens for
+// requests defeats a good chunk of the point of persisting these at all.
+
 async function notifyAdminsOfNewMessage(orderId, customerName, text) {
-  if (!fcmEnabled || adminFcmTokens.size === 0) return;
+  if (!fcmEnabled) {
+    console.log(`[MOON] Skipping push for order ${orderId} -- FCM not enabled (no FIREBASE_SERVICE_ACCOUNT_JSON).`);
+    return;
+  }
+  if (adminFcmTokens.size === 0) {
+    console.log(`[MOON] Skipping push for order ${orderId} -- FCM is enabled but zero admin devices are registered. The Android app must open the admin screen at least once (which calls POST /api/admin/fcm-token) before this can ever succeed.`);
+    return;
+  }
   const tokens = Array.from(adminFcmTokens);
+  console.log(`[MOON] Sending push for order ${orderId} to ${tokens.length} device(s)...`);
   try {
     const resp = await admin.messaging().sendEachForMulticast({
       tokens,
@@ -59,15 +123,39 @@ async function notifyAdminsOfNewMessage(orderId, customerName, text) {
         title: customerName ? `${customerName} -- შეკვეთა #${orderId}` : `შეკვეთა #${orderId}`,
         body: text.slice(0, 200)
       },
-      data: { orderId }
+      data: { orderId },
+      // Without this, FCM's default Android priority is "normal" --
+      // several OEM skins (Xiaomi/MIUI, Samsung, Huawei among them)
+      // will delay or drop a normal-priority push entirely once the
+      // device is in Doze / the app is backgrounded, which is exactly
+      // the "notification never arrives" symptom this addresses.
+      // channelId matches MoonFirebaseMessagingService's channel so a
+      // notification delivered while the app is fully killed (which
+      // bypasses onMessageReceived and is drawn by the OS directly from
+      // this payload) still lands in the same channel as one shown from
+      // the foreground path, instead of a default/fallback channel.
+      android: {
+        priority: 'high',
+        notification: { channelId: 'moon_order_chat' }
+      }
+    });
+    const successCount = resp.responses.filter(r => r.success).length;
+    console.log(`[MOON] Push for order ${orderId}: ${successCount}/${tokens.length} delivered to FCM successfully.`);
+    resp.responses.forEach((r, i) => {
+      if (!r.success) {
+        console.log(`[MOON]   device ...${tokens[i].slice(-12)} failed: ${r.error?.code || r.error?.message}`);
+      }
     });
     // Prune tokens the device itself has invalidated (uninstalled app,
     // token rotated, etc.) so the set doesn't grow with dead entries.
+    let pruned = false;
     resp.responses.forEach((r, i) => {
       if (!r.success && (r.error?.code === 'messaging/registration-token-not-registered')) {
         adminFcmTokens.delete(tokens[i]);
+        pruned = true;
       }
     });
+    if (pruned) persistFcmTokens();
   } catch (e) {
     console.log('[MOON] FCM send failed (chat itself is unaffected):', e.message);
   }
@@ -114,6 +202,14 @@ app.post('/api/sessions', (req, res) => {
   };
   sessions.set(orderId, session);
   io.to('admin_room').emit('new_session', publicSession(orderId, session));
+  // Without this, the FIRST message of a new order (this one, embedded
+  // in session creation) never triggered a push at all -- only messages
+  // sent afterward via the send_message socket handler did. That made it
+  // look like push "only works starting from the second message," when
+  // really the very first one was just never wired to notifyAdminsOfNewMessage.
+  if (firstMessage) {
+    notifyAdminsOfNewMessage(orderId, customer?.username, firstMessage.text || '');
+  }
   res.json({ ok: true, orderId });
 });
 
@@ -151,7 +247,7 @@ app.get('/api/sessions', (req, res) => {
   res.json(active);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, activeSessions: sessions.size, fcmEnabled }));
+app.get('/health', (req, res) => res.json({ ok: true, activeSessions: sessions.size, fcmEnabled, registeredAdminDevices: adminFcmTokens.size }));
 
 // Called once by the Android admin app after it obtains its FCM
 // registration token, so a new customer message can reach the admin's
@@ -159,7 +255,10 @@ app.get('/health', (req, res) => res.json({ ok: true, activeSessions: sessions.s
 app.post('/api/admin/fcm-token', (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'token is required' });
+  const isNew = !adminFcmTokens.has(token);
   adminFcmTokens.add(token);
+  console.log(`[MOON] FCM token ${isNew ? 'registered' : 're-registered'} (...${token.slice(-12)}). Total devices: ${adminFcmTokens.size}. fcmEnabled=${fcmEnabled}`);
+  if (isNew) persistFcmTokens();
   res.json({ ok: true, fcmEnabled });
 });
 
@@ -219,6 +318,14 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`MOON chat server listening on port ${PORT}`);
-});
+(async () => {
+  // Awaited so the server doesn't open for requests -- including the
+  // very request that wakes it from a Render free-tier spin-down, which
+  // is often a brand new order -- until previously-registered devices
+  // are back in adminFcmTokens. See loadPersistedFcmTokens's own comment
+  // for why this specific ordering is what the fix actually depends on.
+  await loadPersistedFcmTokens();
+  server.listen(PORT, () => {
+    console.log(`MOON chat server listening on port ${PORT}`);
+  });
+})();
