@@ -20,6 +20,59 @@ const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
 
+// ---------------- Push notifications (FCM) ----------------
+// Optional and self-disabling: if FIREBASE_SERVICE_ACCOUNT_JSON isn't set
+// as an environment variable yet, push notifications are simply skipped
+// (a warning is logged once) rather than crashing the server. This lets
+// the chat itself work immediately, with push added once Firebase is set
+// up, without a redeploy-breaking dependency in between.
+let admin = null;
+let fcmEnabled = false;
+try {
+  admin = require('firebase-admin');
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (raw) {
+    const serviceAccount = JSON.parse(raw);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    fcmEnabled = true;
+    console.log('[MOON] FCM push notifications enabled.');
+  } else {
+    console.log('[MOON] FIREBASE_SERVICE_ACCOUNT_JSON not set -- push notifications disabled, chat still works normally.');
+  }
+} catch (e) {
+  console.log('[MOON] firebase-admin not usable yet -- push notifications disabled, chat still works normally.', e.message);
+}
+
+// Admin devices that should receive a push when a customer messages --
+// registered via POST /api/admin/fcm-token (the Android app calls this
+// once it has a token). A Set so the same device re-registering doesn't
+// create duplicates.
+const adminFcmTokens = new Set();
+
+async function notifyAdminsOfNewMessage(orderId, customerName, text) {
+  if (!fcmEnabled || adminFcmTokens.size === 0) return;
+  const tokens = Array.from(adminFcmTokens);
+  try {
+    const resp = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: {
+        title: customerName ? `${customerName} -- შეკვეთა #${orderId}` : `შეკვეთა #${orderId}`,
+        body: text.slice(0, 200)
+      },
+      data: { orderId }
+    });
+    // Prune tokens the device itself has invalidated (uninstalled app,
+    // token rotated, etc.) so the set doesn't grow with dead entries.
+    resp.responses.forEach((r, i) => {
+      if (!r.success && (r.error?.code === 'messaging/registration-token-not-registered')) {
+        adminFcmTokens.delete(tokens[i]);
+      }
+    });
+  } catch (e) {
+    console.log('[MOON] FCM send failed (chat itself is unaffected):', e.message);
+  }
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -98,7 +151,17 @@ app.get('/api/sessions', (req, res) => {
   res.json(active);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, activeSessions: sessions.size }));
+app.get('/health', (req, res) => res.json({ ok: true, activeSessions: sessions.size, fcmEnabled }));
+
+// Called once by the Android admin app after it obtains its FCM
+// registration token, so a new customer message can reach the admin's
+// phone even while the app is backgrounded or the site tab is closed.
+app.post('/api/admin/fcm-token', (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token is required' });
+  adminFcmTokens.add(token);
+  res.json({ ok: true, fcmEnabled });
+});
 
 // ---------------- Socket.io ----------------
 
@@ -134,6 +197,13 @@ io.on('connection', (socket) => {
       message: stored,
       customer: session.customer
     });
+    // Real push (FCM), for when the admin app is backgrounded or the
+    // site tab is closed entirely -- the socket-based admin_notify above
+    // only reaches a currently-open tab/app. Only fires for customer
+    // messages; the admin doesn't need a push for their own reply.
+    if (stored.from === 'customer') {
+      notifyAdminsOfNewMessage(orderId, session.customer?.username, stored.text);
+    }
   });
 
   // Admin panel's "Complete order" button -- closes the chat and tells
