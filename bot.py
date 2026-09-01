@@ -1,38 +1,56 @@
 """
-re:TT Checker & Downloader — Discord bot
-Fetches TikTok video analytics + real quality data and posts a styled embed.
+re:TT Analytics DM Bot -- "second bot"
 
-Data sources / honesty notes:
-- Views, Likes, Comments, Shares, Favorites, ID, Region -> REAL, from tikwm.com's
-  public TikTok API (no official TikTok API key needed).
-- Resolution/fps/codec -> REAL, from a lightweight remote ffprobe (reads only
-  the header tikwm's CDN serves, no full download needed).
-- File size & bitrate -> REAL, taken directly from tikwm's own metadata
-  (size/hd_size/wm_size + duration) instead of a HEAD request or full
-  download, since some CDNs don't reliably answer HEAD with Content-Length.
-  Falls back to a full download + ffprobe only if tikwm didn't provide a
-  size for that tier.
-- Shadow ban -> HEURISTIC ONLY. TikTok exposes no official "shadow ban" flag.
-  This bot approximates it from the like-count vs. view-count relationship:
-  very few likes on a video with real reach is a classic shadowban symptom,
-  while healthy like counts read as "not shadowbanned". This is not
-  authoritative, and the middle ground is reported as unknown rather than
-  guessed.
-- VQ Score -> HEURISTIC ONLY (invented). Computed from bitrate + resolution as a
-  rough proxy, 0-100. Not an official TikTok metric.
+A completely separate Discord bot (its own application, its own token, its
+own deployment) whose only job is: receive an HTTP request containing a
+Discord user ID and a TikTok video link, run the exact same analytics
+pipeline as bot.py (tikwm stats + real ffprobe-based quality + shadow-ban
+heuristic), and DM the finished embed straight to that user.
+
+Where the request comes from: the site's admin panel has its own "TikTok
+ანალიტიკის გაგზავნა" tab. The admin pastes a customer's now-finished
+video's TikTok link there and presses send. The browser never talks to
+this bot directly -- it calls a small Cloudflare Worker proxy
+(discord-tiktok-notify-worker.js) instead, which holds this bot's shared
+secret and is the only thing allowed to reach it. That keeps the secret out
+of the site's own JavaScript (and out of view-source).
+
+This is intentionally a fully separate process from bot.py:
+- Its own Discord application/token -- create a second app at
+  https://discord.com/developers/applications, invite IT (not bot.py's
+  app) to the same server your customers are members of. A bot can only
+  DM a user it shares at least one server with, so this step is required.
+- Its own deployment (its own Procfile/Dockerfile/nixpacks.toml/
+  requirements.txt/env.example -- identical in content to bot.py's, since
+  the runtime and dependencies are the same).
+- No on_message / no slash commands / no message_content intent -- unlike
+  bot.py, this bot never listens to channel messages at all. Its only
+  entry point is the HTTP endpoint below. Running it in the SAME server as
+  bot.py is safe: with nothing subscribed to on_message, it can never
+  double-reply to a TikTok link someone posts in a channel.
+
+Data sources / honesty notes (identical to bot.py -- see that file for the
+full pipeline this reuses verbatim):
+- Views, Likes, Comments, Shares, Favorites, ID, Region -> REAL, from
+  tikwm.com's public TikTok API.
+- Resolution/fps/codec -> REAL, from a lightweight remote ffprobe.
+- File size & bitrate -> REAL, from tikwm's own metadata, falling back to
+  a full download + ffprobe only when tikwm doesn't provide a size.
+- Shadow ban -> HEURISTIC ONLY, from the like-count vs. view-count
+  relationship. Not authoritative.
+- VQ Score -> HEURISTIC ONLY (invented), not an official TikTok metric.
 """
 
 import os
 import re
-import io
 import asyncio
 import tempfile
 import subprocess
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
+from aiohttp import web
 import discord
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -41,21 +59,39 @@ load_dotenv(override=True)  # .env always wins over any stray session variable
 TIKWM_API = "https://www.tikwm.com/api/"
 DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 
+# Shared secret this bot checks on every incoming request. Must match
+# whatever the Worker proxy is configured to send as the X-Api-Key header
+# (see discord-tiktok-notify-worker.js). Generate a long random value --
+# e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"` --
+# and put the SAME value in both this bot's env and the Worker's secret.
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
+
+# Platforms like Railway/Render/Heroku inject PORT for you; 8080 is just a
+# sane local-dev default.
+PORT = int(os.environ.get("PORT", "8080"))
+
 # Georgia is a fixed UTC+4 offset year-round (no daylight saving), so we
 # convert timestamps explicitly here rather than relying on Discord's
-# client-side auto-localization, which wasn't matching for this server.
+# client-side auto-localization.
 GEORGIA_TZ = timezone(timedelta(hours=4))
 
+# No message_content intent and no on_message handler at all -- this bot
+# never reads channel messages, only sends DMs on request. Default
+# intents are enough for bot.fetch_user() + user.send().
 intents = discord.Intents.default()
-intents.message_content = True  # required to read link text in normal messages
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
 
 TIKTOK_URL_RE = re.compile(
     r"https?://(?:www\.|vt\.|vm\.)?tiktok\.com/\S+", re.IGNORECASE
 )
 
 
+# ============================================================
+# ANALYTICS PIPELINE -- copied verbatim from bot.py so the two bots always
+# report identical numbers for identical videos. If you change the
+# pipeline in one, copy the change to the other (or better: factor this
+# block out into a shared module both bots import).
+# ============================================================
 async def fetch_tikwm(url: str, hd: bool = True) -> dict:
     # hd=1 is required or tikwm leaves "hdplay" empty/duplicate-of-SD, which
     # was silently hiding the real HD (e.g. 1080p) tier. But hd=1 sometimes
@@ -498,70 +534,128 @@ async def analyze_tiktok_url(url: str) -> discord.Embed:
     return build_embed(meta, sources, original_quality, shadow)
 
 
-@tree.command(name="check", description="TikTok ვიდეოს ანალიტიკის შემოწმება")
-@app_commands.describe(url="TikTok ვიდეოს ლინკი")
-async def check(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()
+# ============================================================
+# HTTP ENTRY POINT -- the only way anything reaches this bot. Everything
+# above this point is identical to bot.py; everything below is new.
+# ============================================================
 
-    if not TIKTOK_URL_RE.search(url):
-        await interaction.followup.send("ეს არ ჰგავს TikTok-ის ლინკს.")
-        return
+async def handle_send_analytics(request: web.Request) -> web.Response:
+    # Shared-secret check -- this endpoint must only ever be reached via
+    # the Worker proxy, which is the one place that knows INTERNAL_API_KEY.
+    # Never expose this bot's own URL directly to the browser/admin panel.
+    if not INTERNAL_API_KEY or request.headers.get("X-Api-Key") != INTERNAL_API_KEY:
+        print("[send-analytics] rejected: missing/wrong X-Api-Key", flush=True)
+        return web.json_response({"error": "unauthorized"}, status=401)
 
     try:
-        embed = await analyze_tiktok_url(url)
-        await interaction.followup.send(embed=embed)
+        payload = await request.json()
+    except Exception:
+        print("[send-analytics] rejected: invalid JSON body", flush=True)
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    discord_id = str(payload.get("discord_id", "")).strip()
+    tiktok_url = str(payload.get("tiktok_url", "")).strip()
+    print(f"[send-analytics] request received for discord_id={discord_id!r} tiktok_url={tiktok_url!r}", flush=True)
+
+    if not discord_id.isdigit():
+        print(f"[send-analytics] rejected: bad discord_id {discord_id!r}", flush=True)
+        return web.json_response(
+            {"error": "discord_id must be a Discord user ID (digits only)"}, status=400
+        )
+    if not TIKTOK_URL_RE.search(tiktok_url):
+        print(f"[send-analytics] rejected: bad tiktok_url {tiktok_url!r}", flush=True)
+        return web.json_response(
+            {"error": "tiktok_url doesn't look like a TikTok link"}, status=400
+        )
+
+    try:
+        embed = await analyze_tiktok_url(tiktok_url)
     except Exception as e:
-        await interaction.followup.send(f"შეცდომა: `{e}`")
+        print(f"[send-analytics] analysis failed for {tiktok_url!r}: {e}", flush=True)
+        return web.json_response({"error": f"analysis failed: {e}"}, status=502)
+
+    try:
+        user = await bot.fetch_user(int(discord_id))
+        await user.send(embed=embed)
+        print(f"[send-analytics] DM sent OK to {discord_id}", flush=True)
+    except discord.Forbidden:
+        # Most common cause: this bot hasn't been invited to any server the
+        # customer is also in yet (Discord blocks DMs from bots you don't
+        # share a server with), or the customer has DMs from server members
+        # turned off, or has blocked this bot.
+        print(f"[send-analytics] Forbidden sending DM to {discord_id} -- no shared server, DMs closed, or blocked", flush=True)
+        return web.json_response(
+            {"error": "could not DM this user (no shared server, DMs closed, or blocked)"},
+            status=403,
+        )
+    except discord.NotFound:
+        print(f"[send-analytics] NotFound: no Discord user with id {discord_id}", flush=True)
+        return web.json_response({"error": "no Discord user with that ID"}, status=404)
+    except Exception as e:
+        print(f"[send-analytics] unexpected error sending DM to {discord_id}: {e}", flush=True)
+        return web.json_response({"error": f"could not send DM: {e}"}, status=502)
+
+    return web.json_response({"ok": True})
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore the bot's own messages / other bots to avoid loops.
-    if message.author.bot:
-        return
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "bot": str(bot.user) if bot.user else None})
 
-    match = TIKTOK_URL_RE.search(message.content)
-    if match:
-        url = match.group(0)
-        async with message.channel.typing():
-            try:
-                embed = await analyze_tiktok_url(url)
-                await message.reply(embed=embed, mention_author=False)
-            except Exception as e:
-                await message.reply(f"შეცდომა: `{e}`", mention_author=False)
 
-    # Keep prefix commands (if any get added later) working.
-    await bot.process_commands(message)
+async def start_web_server():
+    app = web.Application()
+    app.router.add_post("/send-analytics", handle_send_analytics)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[startup] HTTP server listening on 0.0.0.0:{PORT}", flush=True)
+
+
+async def setup_hook():
+    # discord.py calls this once, before login -- the right place to kick
+    # off a background task meant to run for the bot's whole lifetime.
+    bot.loop.create_task(start_web_server())
+
+
+bot.setup_hook = setup_hook
 
 
 @bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"Logged in as {bot.user}")
+    print(f"Logged in as {bot.user}", flush=True)
 
 
 if __name__ == "__main__":
-    print("[startup] bot.py loaded, discord.py module import OK, python process alive.", flush=True)
     if not DISCORD_TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable before running.")
-    print(f"[startup] DISCORD_BOT_TOKEN found (length={len(DISCORD_TOKEN)}, starts with '{DISCORD_TOKEN[:6]}...').", flush=True)
-
-    import logging
-    import sys
-    # Route discord.py's own connection/handshake/retry logs to stdout at
-    # INFO level -- these normally go out via the `logging` module (not
-    # print), so if discord.py is silently retrying a failed handshake or
-    # hitting a privileged-intents error, this makes sure it's visible here
-    # instead of only existing in a stream we might not be capturing.
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("[discord.py] %(asctime)s %(levelname)s %(name)s: %(message)s"))
-
-    print("[startup] calling bot.run() now -- next line should be discord.py's own connection logs...", flush=True)
-    try:
-        bot.run(DISCORD_TOKEN, log_handler=handler, log_level=logging.INFO)
-    except Exception:
-        import traceback
-        print("[startup] bot.run() raised an exception -- full traceback below:", flush=True)
-        traceback.print_exc()
-        raise
-    print("[startup] bot.run() returned on its own -- this should never happen while the bot is meant to stay alive.", flush=True)
+    if not INTERNAL_API_KEY:
+        raise SystemExit(
+            "Set INTERNAL_API_KEY environment variable before running "
+            "(shared secret with discord-tiktok-notify-worker.js)."
+        )
+    # A crashed process on Render restarts almost immediately by default --
+    # if the crash was Discord's Cloudflare layer rate-limiting the LOGIN
+    # itself (HTTP 429, "error code: 0", as opposed to Discord's own
+    # gateway rate limits which discord.py already handles internally),
+    # an instant restart just retries the same login while that rate
+    # limit is still active, which can extend it rather than let it
+    # expire. Retrying here with a real, growing backoff (capped at a
+    # sane maximum) gives the limit time to actually clear, instead of
+    # the hosting platform's restart loop fighting it and potentially
+    # making it worse.
+    import time as _time
+    delay = 30
+    max_delay = 600
+    while True:
+        try:
+            bot.run(DISCORD_TOKEN)
+            break  # bot.run() only returns after a clean shutdown -- not a retry case
+        except discord.errors.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                print(f"[startup] Discord rate-limited the login (HTTP 429) -- waiting {delay}s before retrying, to let the limit clear instead of hammering it...", flush=True)
+                _time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+            else:
+                raise
