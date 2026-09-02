@@ -57,14 +57,15 @@ from dotenv import load_dotenv
 load_dotenv(override=True)  # .env always wins over any stray session variable
 
 TIKWM_API = "https://www.tikwm.com/api/"
-DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+# Added .strip() to clean hidden spaces or newlines that cause "Improper token" error
+DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 
 # Shared secret this bot checks on every incoming request. Must match
 # whatever the Worker proxy is configured to send as the X-Api-Key header
 # (see discord-tiktok-notify-worker.js). Generate a long random value --
 # e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"` --
 # and put the SAME value in both this bot's env and the Worker's secret.
-INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "").strip()
 
 # Platforms like Railway/Render/Heroku inject PORT for you; 8080 is just a
 # sane local-dev default.
@@ -652,6 +653,10 @@ if __name__ == "__main__":
         try:
             bot.run(DISCORD_TOKEN)
             break  # bot.run() only returns after a clean shutdown -- not a retry case
+        except discord.errors.LoginFailure as e:
+            # თუ ტოკენი მართლა არასწორია ან ვადაგასულია, აქ დავიჭერთ და გავაჩერებთ კოდს გასაგები ერორით
+            print(f"\n[CRITICAL ERROR] ბოტის ტოკენი არასწორია! გთხოვთ გადაამოწმოთ DISCORD_BOT_TOKEN. შეცდომა: {e}\n", flush=True)
+            break
         except discord.errors.HTTPException as e:
             if getattr(e, "status", None) == 429:
                 print(f"[startup] Discord rate-limited the login (HTTP 429) -- waiting {delay}s before retrying, to let the limit clear instead of hammering it...", flush=True)
