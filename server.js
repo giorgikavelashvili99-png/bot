@@ -262,6 +262,58 @@ app.post('/api/admin/fcm-token', (req, res) => {
   res.json({ ok: true, fcmEnabled });
 });
 
+// ---------------- Admin activity (Discord join / leave / optimizing) ----------------
+// Called by the site (index.html) -- public endpoint, so input is sanitized
+// and rate limited. Sent as text/plain (no CORS preflight, works with
+// sendBeacon on page close), hence express.text + manual JSON.parse.
+// Push is data-only: the Android app draws it itself, one notification per
+// person (join -> optimizing -> leave replace each other).
+const activityLastHit = new Map(); // ip+type+discordId -> ts
+
+app.post('/api/activity', express.text({ type: '*/*', limit: '2kb' }), (req, res) => {
+  let b;
+  try { b = JSON.parse(req.body); } catch (e) { return res.sendStatus(400); }
+  const clean = v => String(v || '').replace(/[\r\n<>]/g, ' ').slice(0, 60);
+  const type = b && b.type;
+  const name = clean(b.username) || 'უცნობი';
+  const discordId = clean(b.discordId);
+  const detail = clean(b.detail);
+  if (!['join', 'leave', 'optimizing'].includes(type) || !discordId) return res.sendStatus(400);
+
+  const key = req.ip + type + discordId;
+  const now = Date.now();
+  if (now - (activityLastHit.get(key) || 0) < 15000) return res.json({ ok: true, skipped: true });
+  activityLastHit.set(key, now);
+  if (activityLastHit.size > 5000) activityLastHit.clear();
+
+  const texts = {
+    join:       ['🟢 შემოვიდა',             `${name} შემოვიდა Discord-ით`],
+    leave:      ['⚪ გავიდა',                `${name} გავიდა საიტიდან`],
+    optimizing: ['⚙️ აოპტიმიზირებს ვიდეოს', `ამჟამად ${name} აოპტიმიზირებს ვიდეოს${detail ? ' — ' + detail : ''}`]
+  };
+  const [title, body] = texts[type];
+
+  io.to('admin_room').emit('admin_activity', { type, username: name, discordId, detail, ts: now });
+
+  if (fcmEnabled && adminFcmTokens.size > 0) {
+    const tokens = Array.from(adminFcmTokens);
+    admin.messaging().sendEachForMulticast({
+      tokens,
+      data: { type: 'activity', title, body, username: name, discordId },
+      android: { priority: 'high' }
+    }).then(resp => {
+      let pruned = false;
+      resp.responses.forEach((r, i) => {
+        if (!r.success && r.error?.code === 'messaging/registration-token-not-registered') {
+          adminFcmTokens.delete(tokens[i]); pruned = true;
+        }
+      });
+      if (pruned) persistFcmTokens();
+    }).catch(e => console.log('[MOON] activity push failed:', e.message));
+  }
+  res.json({ ok: true });
+});
+
 // ---------------- Socket.io ----------------
 
 io.on('connection', (socket) => {
